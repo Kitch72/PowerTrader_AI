@@ -18,102 +18,42 @@ import logging
 import json
 import uuid
 
-from nacl.signing import SigningKey
-
 # -----------------------------
-# Robinhood market-data (current ASK), same source as rhcb.py trader:
-#   GET /api/v1/crypto/marketdata/best_bid_ask/?symbol=BTC-USD
-#   use result["ask_inclusive_of_buy_spread"]
+# Bybit market-data (current ASK)
+#   GET /v5/market/tickers?category=spot&symbol=BTCUSDT
 # -----------------------------
-ROBINHOOD_BASE_URL = "https://trading.robinhood.com"
+BYBIT_BASE_URL = "https://api.bybit.com"
 
-_RH_MD = None  # lazy-init so import doesn't explode if creds missing
+def _rh_symbol_to_bybit(symbol: str) -> str:
+    s = (symbol or "").upper().strip()
+    if "-" in s:
+        base, quote = s.split("-", 1)
+        if quote == "USD":
+            return f"{base}USDT"
+        return f"{base}{quote}"
+    return s
 
-
-class RobinhoodMarketData:
-    def __init__(self, api_key: str, base64_private_key: str, base_url: str = ROBINHOOD_BASE_URL, timeout: int = 10):
-        self.api_key = (api_key or "").strip()
-        self.base_url = (base_url or "").rstrip("/")
-        self.timeout = timeout
-
-        if not self.api_key:
-            raise RuntimeError("Robinhood API key is empty (r_key.txt).")
-
-        try:
-            raw_private = base64.b64decode((base64_private_key or "").strip())
-            self.private_key = SigningKey(raw_private)
-        except Exception as e:
-            raise RuntimeError(f"Failed to decode Robinhood private key (r_secret.txt): {e}")
-
-        self.session = requests.Session()
-
-    def _get_current_timestamp(self) -> int:
-        return int(time.time())
-
-    def _get_authorization_header(self, method: str, path: str, body: str, timestamp: int) -> dict:
-        # matches the trader's signing format
-        method = method.upper()
-        body = body or ""
-        message_to_sign = f"{self.api_key}{timestamp}{path}{method}{body}"
-        signed = self.private_key.sign(message_to_sign.encode("utf-8"))
-        signature_b64 = base64.b64encode(signed.signature).decode("utf-8")
-
-        return {
-            "x-api-key": self.api_key,
-            "x-timestamp": str(timestamp),
-            "x-signature": signature_b64,
-            "Content-Type": "application/json",
-        }
-
-    def make_api_request(self, method: str, path: str, body: str = "") -> dict:
-        url = f"{self.base_url}{path}"
-        ts = self._get_current_timestamp()
-        headers = self._get_authorization_header(method, path, body, ts)
-
-        resp = self.session.request(method=method.upper(), url=url, headers=headers, data=body or None, timeout=self.timeout)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"Robinhood HTTP {resp.status_code}: {resp.text}")
-        return resp.json()
-
-    def get_current_ask(self, symbol: str) -> float:
-        symbol = (symbol or "").strip().upper()
-        path = f"/api/v1/crypto/marketdata/best_bid_ask/?symbol={symbol}"
-        data = self.make_api_request("GET", path)
-
-        if not data or "results" not in data or not data["results"]:
-            raise RuntimeError(f"Robinhood best_bid_ask returned no results for {symbol}: {data}")
-
-        result = data["results"][0]
-        # EXACTLY like rhcb.py's get_price(): ask_inclusive_of_buy_spread
-        return float(result["ask_inclusive_of_buy_spread"])
-
-
-def robinhood_current_ask(symbol: str) -> float:
+def bybit_current_ask(symbol: str) -> float:
     """
-    Returns Robinhood current BUY price (ask_inclusive_of_buy_spread) for symbols like 'BTC-USD'.
-    Reads creds from r_key.txt and r_secret.txt in the same folder as this script.
+    Returns Bybit current ask for Robinhood-style symbols like 'BTC-USD' (mapped to BTCUSDT).
+    Uses Bybit PUBLIC market endpoint (no API key needed).
     """
-    global _RH_MD
-    if _RH_MD is None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        key_path = os.path.join(base_dir, "r_key.txt")
-        secret_path = os.path.join(base_dir, "r_secret.txt")
+    bybit_symbol = _rh_symbol_to_bybit(symbol)
+    url = f"{BYBIT_BASE_URL}/v5/market/tickers?category=spot&symbol={bybit_symbol}"
+    resp = requests.get(url, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Bybit HTTP {resp.status_code}: {resp.text}")
 
-        if not os.path.isfile(key_path) or not os.path.isfile(secret_path):
-            raise RuntimeError(
-                "Missing r_key.txt and/or r_secret.txt next to pt_thinker.py. "
-                "Run pt_trader.py once to create them (and to set your Robinhood API key)."
-            )
+    data = resp.json()
+    tick_list = (((data or {}).get("result", {}) or {}).get("list", []) or [])
+    if not tick_list:
+        raise RuntimeError(f"Bybit tickers returned no results for {bybit_symbol}: {data}")
 
+    ask = float(tick_list[0].get("ask1Price") or 0.0)
+    if ask <= 0.0:
+        raise RuntimeError(f"Bybit ask invalid for {bybit_symbol}: {tick_list[0]}")
+    return ask
 
-        with open(key_path, "r", encoding="utf-8") as f:
-            api_key = f.read()
-        with open(secret_path, "r", encoding="utf-8") as f:
-            priv_b64 = f.read()
-
-        _RH_MD = RobinhoodMarketData(api_key=api_key, base64_private_key=priv_b64)
-
-    return _RH_MD.get_current_ask(symbol)
 
 
 def restart_program():
@@ -156,7 +96,7 @@ _GUI_SETTINGS_PATH = os.environ.get("POWERTRADER_GUI_SETTINGS") or os.path.join(
 
 _gui_settings_cache = {
 	"mtime": None,
-	"coins": ['BTC', 'ETH', 'XRP', 'BNB', 'DOGE'],  # fallback defaults
+	"coins": ["WLFI"],  # fallback defaults
 }
 
 def _load_gui_coins() -> list:
@@ -730,15 +670,16 @@ def step_coin(sym: str):
 		# reset tf_update for this coin (but DO NOT block-wait; just detect updates and return)
 		tf_update = ['no'] * len(tf_choices)
 
-		# get current price ONCE per coin — use Robinhood's current ASK (same as rhcb trader buy price)
+		# get current price ONCE per coin — use Bybit's current ASK
 		rh_symbol = f"{sym}-USD"
 		while True:
 			try:
-				current = robinhood_current_ask(rh_symbol)
+				current = bybit_current_ask(rh_symbol)
 				break
 			except Exception:
 				time.sleep(1)
 				continue
+
 
 		# IMPORTANT: messages printed below use the bounds currently in state.
 		# We only allow "ready" once messages are generated using a non-startup bounds_version.
